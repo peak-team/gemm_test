@@ -137,14 +137,13 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     }
 
     // Set execution affinity parameter
-    CUexecAffinityParam affinityParam = {}; // Zero initialize
+    CUexecAffinityParam affinityParam; 
     affinityParam.type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
     affinityParam.param.smCount.val = sm_count_to_use;
 
     // Create context with the specified affinity
     // Using cuCtxCreate (v3 is not strictly necessary here unless using specific flags)
-    CUDA_DRIVER_CHECK(cuCtxCreate(&context, CU_CTX_SCHED_AUTO, cuDevice)); // Create context first
-    CUDA_DRIVER_CHECK(cuCtxSetExecAffinity(context, &affinityParam, 1));  // Set affinity on the created context
+    CUDA_DRIVER_CHECK(cuCtxCreate_v3(&context, &affinityParam, 1, 0, cuDevice)); // Create context first
     CUDA_DRIVER_CHECK(cuCtxSetCurrent(context)); // Set context as current for this thread
 
     // --- Handle Creation (must happen *after* context is set) ---

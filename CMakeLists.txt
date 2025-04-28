@@ -93,9 +93,12 @@ foreach(lang CXX)
 endforeach()
 SET(CMAKE_CUDA_ARCHITECTURES 90 89 86 80)
 
+set_source_files_properties(src/gemm_test_mpi.cu PROPERTIES LANGUAGE CUDA)
 add_executable(gemm_test_mpi src/gemm_test_mpi.cu)
 target_link_libraries(gemm_test_mpi PRIVATE
    CUDA::cublas
+   CUDA::cudart
+   CUDA::cuda_driver
    MPI::MPI_C
 )
 
