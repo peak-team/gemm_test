@@ -116,36 +116,6 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
                                      int rank, int deviceId, // Pass device ID
                                      int requested_sm_count) // Pass requested SM count
 {
-    // --- Context Creation with Affinity ---
-    CUcontext context = nullptr;
-    CUdevice cuDevice;
-    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, deviceId)); // Get Driver API device handle
-
-    // Get device properties to find total SM count
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
-    int total_sm_count = prop.multiProcessorCount;
-    int sm_count_to_use = requested_sm_count;
-
-    // Validate requested SM count
-    if (sm_count_to_use <= 0 || sm_count_to_use > total_sm_count) {
-        if (rank == 0 && requested_sm_count > 0) { // Print warning only once if user specified invalid count
-             printf("Warning: Requested SM count (%d) is invalid for GPU %d (Total SMs: %d). Using default (all SMs).\n",
-                    requested_sm_count, deviceId, total_sm_count);
-        }
-        sm_count_to_use = total_sm_count; // Default to all SMs
-    }
-
-    // Set execution affinity parameter
-    CUexecAffinityParam affinityParam[1]; 
-    affinityParam[0].type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
-    affinityParam[0].param.smCount.val = sm_count_to_use;
-
-    // Create context with the specified affinity
-    // Using cuCtxCreate (v3 is not strictly necessary here unless using specific flags)
-    CUDA_DRIVER_CHECK(cuCtxCreate_v3(&context, affinityParam, 1, 0, cuDevice)); // Create context first
-    CUDA_DRIVER_CHECK(cuCtxSetCurrent(context)); // Set context as current for this thread
-
     // --- Handle Creation (must happen *after* context is set) ---
     cublasHandle_t handle = nullptr;
     cublasLtHandle_t ltHandle = nullptr;
@@ -171,7 +141,6 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
              // Cleanup before returning skip
              if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
              CUDA_CHECK(cudaStreamDestroy(stream));
-             CUDA_DRIVER_CHECK(cuCtxDestroy(context)); // Destroy context
              return {0.0f, 0.0};
          }
     }
@@ -197,7 +166,6 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         if(d_A) cudaFreeAsync(d_A, stream); if(d_B) cudaFreeAsync(d_B, stream); if(d_C) cudaFreeAsync(d_C, stream);
         if (handle) CUBLAS_CHECK(cublasDestroy(handle)); if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
         CUDA_CHECK(cudaStreamDestroy(stream));
-        CUDA_DRIVER_CHECK(cuCtxDestroy(context));
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
@@ -294,9 +262,6 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     // Destroy CUDA Events and Stream
     CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaStreamDestroy(stream));
-
-    // Destroy the CUDA context
-    CUDA_DRIVER_CHECK(cuCtxDestroy(context));
 
     return {milliseconds, t_ops};
 }
@@ -399,6 +364,36 @@ int main(int argc, char *argv[]) {
     std::array<float, NUM_TEST_TYPES> reduced_times_sum = {0.0f}; // Only used on Rank 0
     std::array<double, NUM_TEST_TYPES> reduced_tops_sum = {0.0}; // Only used on Rank 0
 
+    // --- Context Creation with Affinity ---
+    CUcontext context = nullptr;
+    CUdevice cuDevice;
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, deviceId)); // Get Driver API device handle
+
+    // Get device properties to find total SM count
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
+    int total_sm_count = prop.multiProcessorCount;
+    int sm_count_to_use = requested_sm_count;
+
+    // Validate requested SM count
+    if (sm_count_to_use <= 0 || sm_count_to_use > total_sm_count) {
+        if (rank == 0 && requested_sm_count > 0) { // Print warning only once if user specified invalid count
+             printf("Warning: Requested SM count (%d) is invalid for GPU %d (Total SMs: %d). Using default (all SMs).\n",
+                    requested_sm_count, deviceId, total_sm_count);
+        }
+        sm_count_to_use = total_sm_count; // Default to all SMs
+    }
+
+    // Set execution affinity parameter
+    CUexecAffinityParam affinityParam[1]; 
+    affinityParam[0].type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
+    affinityParam[0].param.smCount.val = sm_count_to_use;
+
+    // Create context with the specified affinity
+    // Using cuCtxCreate (v3 is not strictly necessary here unless using specific flags)
+    CUDA_DRIVER_CHECK(cuCtxCreate_v3(&context, affinityParam, 1, 0, cuDevice)); // Create context first
+    CUDA_DRIVER_CHECK(cuCtxSetCurrent(context)); // Set context as current for this thread
+
     // --- Run Selected Tests & Reduce ---
     // Pass deviceId and sm_count to runGemmTest
     if (run_flags[static_cast<int>(GemmOpIndex::DGEMM)]) {
@@ -469,6 +464,9 @@ int main(int argc, char *argv[]) {
         }
         printf("|--------------------|--------------------|-------------|\n");
     }
+
+    // Destroy the CUDA context
+    CUDA_DRIVER_CHECK(cuCtxDestroy(context));
 
     MPI_Finalize();
     return 0;
