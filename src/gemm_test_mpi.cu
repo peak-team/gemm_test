@@ -373,13 +373,13 @@ int main(int argc, char *argv[]) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
     int total_sm_count = prop.multiProcessorCount;
-    int sm_count_to_use = requested_sm_count;
+    int sm_count_to_use = sm_count;
 
     // Validate requested SM count
     if (sm_count_to_use <= 0 || sm_count_to_use > total_sm_count) {
-        if (rank == 0 && requested_sm_count > 0) { // Print warning only once if user specified invalid count
+        if (rank == 0 && sm_count > 0) { // Print warning only once if user specified invalid count
              printf("Warning: Requested SM count (%d) is invalid for GPU %d (Total SMs: %d). Using default (all SMs).\n",
-                    requested_sm_count, deviceId, total_sm_count);
+                    sm_count, deviceId, total_sm_count);
         }
         sm_count_to_use = total_sm_count; // Default to all SMs
     }
