@@ -365,6 +365,7 @@ int main(int argc, char *argv[]) {
     std::array<double, NUM_TEST_TYPES> reduced_tops_sum = {0.0}; // Only used on Rank 0
 
     // --- Context Creation with Affinity ---
+    CUcontext context = nullptr;
     CUdevice cuDevice;
     CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, deviceId)); // Get Driver API device handle
 
@@ -382,6 +383,16 @@ int main(int argc, char *argv[]) {
         }
         sm_count_to_use = total_sm_count; // Default to all SMs
     }
+
+    // Set execution affinity parameter
+    CUexecAffinityParam affinityParam[1]; 
+    affinityParam[0].type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
+    affinityParam[0].param.smCount.val = sm_count_to_use;
+
+    // Create context with the specified affinity
+    // Using cuCtxCreate (v3 is not strictly necessary here unless using specific flags)
+    CUDA_DRIVER_CHECK(cuCtxCreate_v3(&context, affinityParam, 1, 0, cuDevice)); // Create context first
+    CUDA_DRIVER_CHECK(cuCtxSetCurrent(context)); // Set context as current for this thread
 
     // --- Run Selected Tests & Reduce ---
     // Pass deviceId and sm_count to runGemmTest
@@ -453,6 +464,9 @@ int main(int argc, char *argv[]) {
         }
         printf("|--------------------|--------------------|-------------|\n");
     }
+
+    // Destroy the CUDA context
+    CUDA_DRIVER_CHECK(cuCtxDestroy(context));
 
     MPI_Finalize();
     return 0;
