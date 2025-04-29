@@ -218,7 +218,7 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     // (Calls remain the same, using handle or ltHandle as appropriate)
     if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) { CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc)); }
     else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) { CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc)); }
-    else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP; CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, algo)); }
+    else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT)); }
     else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) { CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, stream)); }
     CUDA_CHECK(cudaStreamSynchronize(stream)); // Sync after warm-up
 
@@ -229,7 +229,7 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         // (Calls remain the same, using handle or ltHandle as appropriate)
         if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) { CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc)); }
         else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) { CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc)); }
-        else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP; CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, algo)); }
+        else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT)); }
         else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) { CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, stream)); }
     }
     CUDA_CHECK(cudaEventRecord(stop, stream));
