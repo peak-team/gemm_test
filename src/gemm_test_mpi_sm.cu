@@ -279,7 +279,7 @@ int main(int argc, char *argv[]) {
     CUDA_DRIVER_CHECK(cuInit(0));
 
     // Default values
-    int m = 4096, n = 4096, k = 4096, iterations = 10;
+    int m = 4096, n = 4096, k = 4096, iterations = 100;
     int sm_count = 0; // Default: use all SMs
     bool transposeA = true, transposeB = false, verbose = false;
     std::array<bool, NUM_TEST_TYPES> run_flags = {true, false, true, true}; // D, Z, Ex, Lt
