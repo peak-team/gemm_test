@@ -217,6 +217,19 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     // Use streams[0] to sync memory operations before warm-up
     CUDA_CHECK(cudaStreamSynchronize(streams[0]));
 
+    // Set SM count within cublas
+    if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+        CUBLAS_CHECK(cublasSetSmCountTarget((cublasHandle_t)ltHandle, requested_sm_count));
+        // int smCountTarget;
+        // cublasGetSmCountTarget((cublasHandle_t)ltHandle, &smCountTarget);
+        // printf("SM: %d\n", smCountTarget);
+    } else {
+        CUBLAS_CHECK(cublasSetSmCountTarget(handle, requested_sm_count));
+        // int smCountTarget;
+        // cublasGetSmCountTarget(handle, &smCountTarget);
+        // printf("SM: %d\n", smCountTarget);
+    }
+
     // --- Warm-up ---
     // Perform warm-up on streams[0]
     if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
@@ -429,15 +442,14 @@ int main(int argc, char *argv[]) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
     int total_sm_count = prop.multiProcessorCount;
-    int sm_count_to_use = sm_count;
 
     // Validate requested SM count
-    if (sm_count_to_use <= 0 || sm_count_to_use > total_sm_count) {
+    if (sm_count <= 0 || sm_count > total_sm_count) {
         if (rank == 0 && sm_count > 0) { // Print warning only once if user specified invalid count
              printf("Warning: Requested SM count (%d) is invalid for GPU %d (Total SMs: %d). Using default (all SMs).\n",
                     sm_count, deviceId, total_sm_count);
         }
-        sm_count_to_use = total_sm_count; // Default to all SMs
+        sm_count = total_sm_count; // Default to all SMs
     }
 
     if (num_streams <= 0) {
