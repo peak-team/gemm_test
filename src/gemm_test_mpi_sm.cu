@@ -467,7 +467,7 @@ int main(int argc, char *argv[]) {
                 bool skipped_agg = (fabs(reduced_times_sum[i]) < std::numeric_limits<float>::epsilon() * size &&
                                     fabs(reduced_tops_sum[i]) < std::numeric_limits<double>::epsilon() * size);
 
-                if (skipped_agg && (static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) || (static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8)) {
+                if (skipped_agg && ((static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) || (static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8))) {
                     printf("| %-18s | %18s | %11s |\n", opNames[i], "Skipped", "N/A");
                 } else {
                     double avg_time_all_ranks = (size > 0 && iterations > 0) ? reduced_times_sum[i] / size / iterations : 0.0;
