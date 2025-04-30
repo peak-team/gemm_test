@@ -136,10 +136,11 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     int lda = transposeA ? k : m;
     int ldb = transposeB ? n : k;
     int ldc = m;
-    if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+    if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8 || OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
          if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
              // Cleanup before returning skip
              if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
+             if (handle) CUBLAS_CHECK(cublasDestroy(handle));
              CUDA_CHECK(cudaStreamDestroy(stream));
              return {0.0f, 0.0};
          }
@@ -204,8 +205,8 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     void *workspace = nullptr; size_t workspaceSize = 0;
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
         cudaDataType_t scaleType = CUDA_R_32I; cublasComputeType_t computeType = CUBLAS_COMPUTE_32I;
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CudaDataType<TypeA>::value, transposeA ? m : k, transposeA ? k : m, lda));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CudaDataType<TypeB>::value, transposeB ? k : n, transposeB ? n : k, ldb));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CudaDataType<TypeA>::value, lda, transposeA ? m : k, lda));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CudaDataType<TypeB>::value, ldb, transposeB ? k : n, ldb));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CudaDataType<TypeC>::value, m, n, ldc));
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, computeType, scaleType));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
@@ -286,33 +287,45 @@ int main(int argc, char *argv[]) {
 
     // Option parsing
     static struct option long_options[] = {
-        {"m", required_argument, 0, 'm'}, {"n", required_argument, 0, 'n'},
-        {"k", required_argument, 0, 'k'}, {"transposeA", required_argument, 0, 'a'},
-        {"transposeB", required_argument, 0, 'b'}, {"iterations", required_argument, 0, 'i'},
-        {"sm-count", required_argument, 0, 's'}, // New option for SM count
-        {"verbose", no_argument, 0, 'v'}, {"mn", required_argument, 0, '1'},
-        {"mk", required_argument, 0, '2'}, {"nk", required_argument, 0, '3'},
+        {"m", required_argument, 0, 'm'},
+        {"n", required_argument, 0, 'n'},
+        {"k", required_argument, 0, 'k'},
+        {"transposeA", required_argument, 0, 'a'},
+        {"transposeB", required_argument, 0, 'b'},
+        {"iterations", required_argument, 0, 'i'},
+        {"verbose", no_argument, 0, 'v'},
+        {"mn", required_argument, 0, '1'},
+        {"mk", required_argument, 0, '2'},
+        {"nk", required_argument, 0, '3'},
         {"mnk", required_argument, 0, '4'},
-        {"dgemm", required_argument, 0, 'd'}, {"zgemm", required_argument, 0, 'z'},
-        {"gemmex", required_argument, 0, 'g'}, {"ltmatmul", required_argument, 0, 'l'},
+	    {"dgemm", required_argument, 0, 'd'},      
+        {"zgemm", required_argument, 0, 'z'},
+	    {"gemmex", required_argument, 0, 'g'},
+	    {"ltmatmul", required_argument, 0, 'l'},
+        {"sm-count", required_argument, 0, 's'},
         {0, 0, 0, 0}
     };
     int opt; int option_index = 0;
     // Add 's:' to getopt short options string
     while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:s:v1:2:3:4:d:z:g:l:", long_options, &option_index)) != -1) {
         switch (opt) {
-            case 'm': m = atoi(optarg); break; case 'n': n = atoi(optarg); break;
-            case 'k': k = atoi(optarg); break; case 'a': transposeA = atoi(optarg) != 0; break;
-            case 'b': transposeB = atoi(optarg) != 0; break; case 'i': iterations = atoi(optarg); break;
+            case 'm': m = atoi(optarg); break; 
+            case 'n': n = atoi(optarg); break;
+            case 'k': k = atoi(optarg); break; 
+            case 'a': transposeA = atoi(optarg) != 0; break;
+            case 'b': transposeB = atoi(optarg) != 0; break; 
+            case 'i': iterations = atoi(optarg); break;
             case 's': sm_count = atoi(optarg); break; // Parse SM count
-            case 'v': verbose = true; break; case '1': m = n = atoi(optarg); break;
-            case '2': m = k = atoi(optarg); break; case '3': n = k = atoi(optarg); break;
+            case 'v': verbose = true; break; 
+            case '1': m = n = atoi(optarg); break;
+            case '2': m = k = atoi(optarg); break; 
+            case '3': n = k = atoi(optarg); break;
             case '4': m = n = k = atoi(optarg); break;
             case 'd': run_flags[static_cast<int>(GemmOpIndex::DGEMM)] = (atoi(optarg) != 0); break;
             case 'z': run_flags[static_cast<int>(GemmOpIndex::ZGEMM)] = (atoi(optarg) != 0); break;
             case 'g': run_flags[static_cast<int>(GemmOpIndex::GEMM_EX_INT8)] = (atoi(optarg) != 0); break;
             case 'l': run_flags[static_cast<int>(GemmOpIndex::LT_MATMUL_INT8)] = (atoi(optarg) != 0); break;
-            case '?': if (rank == 0) { fprintf(stderr, "Usage: %s [-m M] [-n N] [-k K] [-i ITERS] [-s SM_COUNT] [-a 0|1] [-b 0|1] [-v] [--dgemm 0|1] ...\n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
+            case '?': if (rank == 0) { fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--sm-count|-s] <sm_count>\n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
             default: if (rank == 0) fprintf(stderr, "Unexpected option parsing error.\n"); MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
     }
@@ -454,7 +467,7 @@ int main(int argc, char *argv[]) {
                 bool skipped_agg = (fabs(reduced_times_sum[i]) < std::numeric_limits<float>::epsilon() * size &&
                                     fabs(reduced_tops_sum[i]) < std::numeric_limits<double>::epsilon() * size);
 
-                if (skipped_agg && static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) {
+                if (skipped_agg && (static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) || (static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8)) {
                     printf("| %-18s | %18s | %11s |\n", opNames[i], "Skipped", "N/A");
                 } else {
                     double avg_time_all_ranks = (size > 0 && iterations > 0) ? reduced_times_sum[i] / size / iterations : 0.0;
