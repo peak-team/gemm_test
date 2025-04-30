@@ -219,15 +219,9 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
 
     // Set SM count within cublas
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
-        CUBLAS_CHECK(cublasSetSmCountTarget((cublasHandle_t)ltHandle, requested_sm_count));
-        // int smCountTarget;
-        // cublasGetSmCountTarget((cublasHandle_t)ltHandle, &smCountTarget);
-        // printf("SM: %d\n", smCountTarget);
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &requested_sm_count, sizeof(requested_sm_count)));
     } else {
         CUBLAS_CHECK(cublasSetSmCountTarget(handle, requested_sm_count));
-        // int smCountTarget;
-        // cublasGetSmCountTarget(handle, &smCountTarget);
-        // printf("SM: %d\n", smCountTarget);
     }
 
     // --- Warm-up ---
