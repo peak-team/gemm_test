@@ -203,6 +203,11 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
     cublasLtMatmulDesc_t matmulDesc = nullptr;
     void *workspace = nullptr; size_t workspaceSize = 0;
+
+    int returnedResults = 0;
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    cublasLtMatmulPreference_t matmulPreference = nullptr;
+
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
         cudaDataType_t scaleType = CUDA_R_32I; cublasComputeType_t computeType = CUBLAS_COMPUTE_32I;
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CudaDataType<TypeA>::value, lda, transposeA ? m : k, lda));
@@ -213,6 +218,14 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
         // Use streams[0] for workspace allocation
         workspaceSize = 1024 * 1024 * 4; CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, streams[0]));
+
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&matmulPreference));
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(matmulPreference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, matmulDesc, Adesc, Bdesc, Cdesc, Cdesc, matmulPreference, 1, &heuristicResult, &returnedResults));
+        const cublasLtMatmulTile_t tileId = CUBLASLT_MATMUL_TILE_128x64;
+        const cublasLtMatmulStages_t stageId = CUBLASLT_MATMUL_STAGES_128x3;
+        CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tileId, sizeof(tileId)));
+        CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stageId, sizeof(stageId)));
     }
     // Use streams[0] to sync memory operations before warm-up
     CUDA_CHECK(cudaStreamSynchronize(streams[0]));
@@ -237,7 +250,7 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
     } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
         // Pass streams[0] as argument for Lt API
-        CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, streams[0]));
+        CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, streams[0]));
     }
     // Sync warm-up on streams[0]
     CUDA_CHECK(cudaStreamSynchronize(streams[0]));
@@ -264,7 +277,7 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
             CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
         } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
             // Pass current stream as argument for Lt API
-            CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, current_stream));
+            CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, current_stream));
         }
     }
 
