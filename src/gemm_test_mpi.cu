@@ -106,6 +106,10 @@ enum class GemmOpIndex {
 };
 const int NUM_TEST_TYPES = static_cast<int>(GemmOpIndex::COUNT);
 
+// --- Add a constant for the number of streams ---
+// Place this near the top of the function or make it a parameter if desired
+const int num_streams = 16; // Or 8, 32, etc. A balance is needed.
+
 // --- Generic GEMM Test Function ---
 // Returns: { total_milliseconds, t_ops } for this rank
 template <GemmOpIndex OperationTypeIndex,
@@ -113,10 +117,20 @@ template <GemmOpIndex OperationTypeIndex,
 std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool transposeB, int iterations,
                                      double flopsPerOp,
                                      const char* opName,
-                                     int rank, int deviceId, // Pass device ID
-                                     int requested_sm_count) // Pass requested SM count
+                                     int rank, int deviceId,
+                                     int requested_sm_count)
 {
-    // --- Handle Creation (must happen *after* context is set) ---
+    // --- Rest of the setup (LDA, LDB, LDC, LtMatmul constraints check) ---
+    int lda = transposeA ? k : m;
+    int ldb = transposeB ? n : k;
+    int ldc = m;
+    if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8 || OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+        if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
+            return {0.0f, 0.0};
+        }
+    }
+
+    // --- Handle Creation (No change here) ---
     cublasHandle_t handle = nullptr;
     cublasLtHandle_t ltHandle = nullptr;
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
@@ -125,37 +139,24 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasCreate(&handle));
     }
 
-    // --- Stream Creation (operates within the current context) ---
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    if constexpr (OperationTypeIndex != GemmOpIndex::LT_MATMUL_INT8) {
-        CUBLAS_CHECK(cublasSetStream(handle, stream)); // Associate v2 handle with stream
+    std::vector<cudaStream_t> streams(num_streams);
+    for (int i = 0; i < num_streams; ++i) {
+        CUDA_CHECK(cudaStreamCreate(&streams[i]));
     }
+    // Note: cublasSetStream will be called *inside* the loop for v2 API calls.
 
-    // --- Rest of the setup (LDA, LDB, LDC, LtMatmul constraints check) ---
-    int lda = transposeA ? k : m;
-    int ldb = transposeB ? n : k;
-    int ldc = m;
-    if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8 || OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
-         if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
-             // Cleanup before returning skip
-             if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
-             if (handle) CUBLAS_CHECK(cublasDestroy(handle));
-             CUDA_CHECK(cudaStreamDestroy(stream));
-             return {0.0f, 0.0};
-         }
-    }
-
-    // --- Memory Allocation ---
+    // --- Memory Allocation (MODIFIED) ---
+    // Use streams[0] for async memory operations for simplicity
     size_t sizeA = static_cast<size_t>(lda) * (transposeA ? m : k) * sizeof(TypeA);
     size_t sizeB = static_cast<size_t>(ldb) * (transposeB ? k : n) * sizeof(TypeB);
     size_t sizeC = static_cast<size_t>(ldc) * n * sizeof(TypeC);
     TypeA *d_A = nullptr; TypeB *d_B = nullptr; TypeC *d_C = nullptr;
     TypeA *h_A = nullptr; TypeB *h_B = nullptr;
     bool alloc_success = true;
-    CUDA_CHECK(cudaMallocAsync(&d_A, sizeA, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_B, sizeB, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_C, sizeC, stream));
+    // Use streams[0] for memory ops
+    CUDA_CHECK(cudaMallocAsync(&d_A, sizeA, streams[0]));
+    CUDA_CHECK(cudaMallocAsync(&d_B, sizeB, streams[0]));
+    CUDA_CHECK(cudaMallocAsync(&d_C, sizeC, streams[0]));
     h_A = (TypeA *)malloc(sizeA);
     h_B = (TypeB *)malloc(sizeB);
     if (!h_A || !h_B) {
@@ -164,14 +165,15 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     }
     if (!alloc_success) { // Cleanup and abort
         if (h_A) free(h_A); if (h_B) free(h_B);
-        if(d_A) cudaFreeAsync(d_A, stream); if(d_B) cudaFreeAsync(d_B, stream); if(d_C) cudaFreeAsync(d_C, stream);
+        // Use streams[0] for freeing
+        if(d_A) cudaFreeAsync(d_A, streams[0]); if(d_B) cudaFreeAsync(d_B, streams[0]); if(d_C) cudaFreeAsync(d_C, streams[0]);
         if (handle) CUBLAS_CHECK(cublasDestroy(handle)); if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
-        CUDA_CHECK(cudaStreamDestroy(stream));
+        // Destroy streams before abort
+        for (int i = 0; i < num_streams; ++i) { cudaStreamDestroy(streams[i]); }
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
     // --- Initialization & Copy ---
-    // (Random initialization code remains the same)
     for (size_t i = 0; i < sizeA / sizeof(TypeA); i++) {
         if constexpr (std::is_same_v<TypeA, cuDoubleComplex>) { h_A[i].x = (double)(rand() % 100)/100.0; h_A[i].y = (double)(rand() % 100)/100.0; }
         else if constexpr (std::is_same_v<TypeA, int8_t>) { h_A[i] = static_cast<int8_t>(rand() % 200 - 100); }
@@ -184,13 +186,14 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         else if constexpr (std::is_floating_point_v<TypeB>) { h_B[i] = static_cast<TypeB>((rand() % 1000 - 500) / 500.0); }
         else { h_B[i] = static_cast<TypeB>(rand() % 100); }
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Sync before copy
-    CUDA_CHECK(cudaMemcpyAsync(d_A, h_A, sizeA, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_B, h_B, sizeB, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemsetAsync(d_C, 0, sizeC, stream)); // Initialize C
+    // ... initialization loops ...
+    // Use streams[0] for sync and copies
+    CUDA_CHECK(cudaStreamSynchronize(streams[0])); // Sync allocs on streams[0]
+    CUDA_CHECK(cudaMemcpyAsync(d_A, h_A, sizeA, cudaMemcpyHostToDevice, streams[0]));
+    CUDA_CHECK(cudaMemcpyAsync(d_B, h_B, sizeB, cudaMemcpyHostToDevice, streams[0]));
+    CUDA_CHECK(cudaMemsetAsync(d_C, 0, sizeC, streams[0])); // Initialize C on streams[0]
 
     // --- Setup (Transpose, Scalars, Events, LtMatmul Descriptors) ---
-    // (This part remains the same as the previous version)
     cublasOperation_t opA = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = transposeB ? CUBLAS_OP_T : CUBLAS_OP_N;
     TypeCompute alpha_compute, beta_compute; // Scalars
@@ -211,62 +214,105 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, computeType, scaleType));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
-        workspaceSize = 1024 * 1024 * 4; CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, stream));
+        // Use streams[0] for workspace allocation
+        workspaceSize = 1024 * 1024 * 4; CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, streams[0]));
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Sync before warm-up
+    // Use streams[0] to sync memory operations before warm-up
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
 
     // --- Warm-up ---
-    // (Calls remain the same, using handle or ltHandle as appropriate)
-    if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) { CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc)); }
-    else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) { CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc)); }
-    else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT)); }
-    else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) { CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, stream)); }
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Sync after warm-up
-
-    // --- Timed Execution ---
-    MPI_Barrier(MPI_COMM_WORLD);
-    CUDA_CHECK(cudaEventRecord(start, stream));
-    for (int i = 0; i < iterations; i++) {
-        // (Calls remain the same, using handle or ltHandle as appropriate)
-        if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) { CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc)); }
-        else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) { CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc)); }
-        else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) { CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT)); }
-        else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) { CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, stream)); }
+    // Perform warm-up on streams[0]
+    if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
+        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+        CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc));
+    } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
+        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+        CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc));
+    } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+        CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+    } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+        // Pass streams[0] as argument for Lt API
+        CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, streams[0]));
     }
-    CUDA_CHECK(cudaEventRecord(stop, stream));
+    // Sync warm-up on streams[0]
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+
+    // --- Timed Execution (MODIFIED) ---
+    MPI_Barrier(MPI_COMM_WORLD); // Ensure all ranks start together
+
+    // Record start event on streams[0] *before* launching any timed work
+    CUDA_CHECK(cudaEventRecord(start, streams[0]));
+
+    for (int i = 0; i < iterations; i++) {
+        // Select stream for this iteration
+        cudaStream_t current_stream = streams[i % num_streams];
+
+        // (Conditional GEMM calls remain the same)
+        if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
+            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+            CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double *)&alpha_compute, d_A, lda, d_B, ldb, (const double *)&beta_compute, d_C, ldc));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
+            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+            CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex *)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex *)&beta_compute, d_C, ldc));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+            CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+            // Pass current stream as argument for Lt API
+            CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, NULL, workspace, workspaceSize, current_stream));
+        }
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // --- Results ---
+    // --- Results (CORRECTED Timing Logic) ---
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(stop, streams[0]));
     CUDA_CHECK(cudaEventSynchronize(stop));
+
     float milliseconds = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
     double total_ops = flopsPerOp * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k) * iterations;
     double avg_time_s = (milliseconds / 1000.0);
     double t_ops = (avg_time_s > 1e-9 && iterations > 0) ? (total_ops / avg_time_s) / 1e12 : 0.0;
 
-    // --- Cleanup ---
+    // --- Cleanup (MODIFIED) ---
     free(h_A); free(h_B); // Host memory
-    CUDA_CHECK(cudaFreeAsync(d_A, stream)); CUDA_CHECK(cudaFreeAsync(d_B, stream)); CUDA_CHECK(cudaFreeAsync(d_C, stream)); // Device matrices
+
+    // Use streams[0] for async frees
+    CUDA_CHECK(cudaFreeAsync(d_A, streams[0]));
+    CUDA_CHECK(cudaFreeAsync(d_B, streams[0]));
+    CUDA_CHECK(cudaFreeAsync(d_C, streams[0]));
+
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) { // Lt specific device cleanup
         if (Adesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
         if (Bdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
         if (Cdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
         if (matmulDesc) CUBLAS_CHECK(cublasLtMatmulDescDestroy(matmulDesc));
-        if (workspace) CUDA_CHECK(cudaFreeAsync(workspace, stream));
+        // Use streams[0] for workspace free
+        if (workspace) CUDA_CHECK(cudaFreeAsync(workspace, streams[0]));
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Wait for async frees
 
-    // Destroy cuBLAS handles *before* destroying the context they used
+    // Wait for async frees on streams[0] to complete before destroying streams/handles
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+
+    // Destroy cuBLAS handles
     if (handle) CUBLAS_CHECK(cublasDestroy(handle));
     if (ltHandle) CUBLAS_CHECK(cublasLtDestroy(ltHandle));
 
-    // Destroy CUDA Events and Stream
-    CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop));
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    // Destroy CUDA Events
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Destroy all CUDA Streams
+    // Replace: CUDA_CHECK(cudaStreamDestroy(stream));
+    for (int i = 0; i < num_streams; ++i) {
+        CUDA_CHECK(cudaStreamDestroy(streams[i]));
+    }
 
     return {milliseconds, t_ops};
 }
-
 
 int main(int argc, char *argv[]) {
     // --- MPI Initialization ---
@@ -454,7 +500,7 @@ int main(int argc, char *argv[]) {
                 bool skipped_agg = (fabs(reduced_times_sum[i]) < std::numeric_limits<float>::epsilon() * size &&
                                     fabs(reduced_tops_sum[i]) < std::numeric_limits<double>::epsilon() * size);
 
-                if (skipped_agg && (static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) || (static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8)) {
+                if (skipped_agg && ((static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8) || (static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8))) {
                     printf("| %-18s | %18s | %11s |\n", opNames[i], "Skipped", "N/A");
                 } else {
                     double avg_time_all_ranks = (size > 0 && iterations > 0) ? reduced_times_sum[i] / size / iterations : 0.0;
