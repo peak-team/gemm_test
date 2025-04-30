@@ -222,10 +222,12 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&matmulPreference));
         CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(matmulPreference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
         CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, matmulDesc, Adesc, Bdesc, Cdesc, Cdesc, matmulPreference, 1, &heuristicResult, &returnedResults));
-        const cublasLtMatmulTile_t tileId = CUBLASLT_MATMUL_TILE_128x64;
-        const cublasLtMatmulStages_t stageId = CUBLASLT_MATMUL_STAGES_128x3;
-        CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tileId, sizeof(tileId)));
-        CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stageId, sizeof(stageId)));
+        //cublasLtMatmulTile_t tileId = CUBLASLT_MATMUL_TILE_128x128;
+        //cublasLtMatmulStages_t stageId = CUBLASLT_MATMUL_STAGES_UNDEFINED;
+        //CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tileId, sizeof(tileId)));
+	//size_t size_written;
+	//CUBLAS_CHECK(cublasLtMatmulAlgoCapGetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CAP_STAGES_IDS, (void*)&stageId, sizeof(stageId), &size_written));
+        //CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stageId, sizeof(stageId)));
     }
     // Use streams[0] to sync memory operations before warm-up
     CUDA_CHECK(cudaStreamSynchronize(streams[0]));
