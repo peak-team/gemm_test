@@ -106,10 +106,6 @@ enum class GemmOpIndex {
 };
 const int NUM_TEST_TYPES = static_cast<int>(GemmOpIndex::COUNT);
 
-// --- Add a constant for the number of streams ---
-// Place this near the top of the function or make it a parameter if desired
-const int num_streams = 16; // Or 8, 32, etc. A balance is needed.
-
 // --- Generic GEMM Test Function ---
 // Returns: { total_milliseconds, t_ops } for this rank
 template <GemmOpIndex OperationTypeIndex,
@@ -118,7 +114,8 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
                                      double flopsPerOp,
                                      const char* opName,
                                      int rank, int deviceId,
-                                     int requested_sm_count)
+                                     int requested_sm_count,
+                                     int num_streams)
 {
     // --- Rest of the setup (LDA, LDB, LDC, LtMatmul constraints check) ---
     int lda = transposeA ? k : m;
@@ -328,6 +325,7 @@ int main(int argc, char *argv[]) {
     // Default values
     int m = 4096, n = 4096, k = 4096, iterations = 100;
     int sm_count = 0; // Default: use all SMs
+    int num_streams = 1;
     bool transposeA = true, transposeB = false, verbose = false;
     std::array<bool, NUM_TEST_TYPES> run_flags = {true, false, true, true}; // D, Z, Ex, Lt
 
@@ -349,10 +347,11 @@ int main(int argc, char *argv[]) {
 	    {"gemmex", required_argument, 0, 'g'},
 	    {"ltmatmul", required_argument, 0, 'l'},
         {"sm-count", required_argument, 0, 's'},
+        {"stream-count", required_argument, 0, 't'},
         {0, 0, 0, 0}
     };
     int opt; int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:s:v1:2:3:4:d:z:g:l:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:s:t:v1:2:3:4:d:z:g:l:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'm': m = atoi(optarg); break; 
             case 'n': n = atoi(optarg); break;
@@ -361,6 +360,7 @@ int main(int argc, char *argv[]) {
             case 'b': transposeB = atoi(optarg) != 0; break; 
             case 'i': iterations = atoi(optarg); break;
             case 's': sm_count = atoi(optarg); break; // Parse SM count
+            case 't': num_streams = atoi(optarg); break; 
             case 'v': verbose = true; break; 
             case '1': m = n = atoi(optarg); break;
             case '2': m = k = atoi(optarg); break; 
@@ -370,7 +370,7 @@ int main(int argc, char *argv[]) {
             case 'z': run_flags[static_cast<int>(GemmOpIndex::ZGEMM)] = (atoi(optarg) != 0); break;
             case 'g': run_flags[static_cast<int>(GemmOpIndex::GEMM_EX_INT8)] = (atoi(optarg) != 0); break;
             case 'l': run_flags[static_cast<int>(GemmOpIndex::LT_MATMUL_INT8)] = (atoi(optarg) != 0); break;
-            case '?': if (rank == 0) { fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--sm-count|-s] <sm_count>\n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
+            case '?': if (rank == 0) { fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--sm-count|-s] <sm_count> [--stream-count|-t] <stream_count>\n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
             default: if (rank == 0) fprintf(stderr, "Unexpected option parsing error.\n"); MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
     }
@@ -400,8 +400,8 @@ int main(int argc, char *argv[]) {
         if (verbose) {
             printf("---------------------------------------------------------------------\n");
             printf("MPI GEMM Test: m=%d, n=%d, k=%d, iterations=%d, ranks=%d\n", m, n, k, iterations, size);
-            printf("Transpose A: %s, Transpose B: %s, SM Count: %d (0=default)\n",
-                   transposeA ? "Yes" : "No", transposeB ? "Yes" : "No", sm_count); // Show SM count
+            printf("Transpose A: %s, Transpose B: %s, SM Count: %d, Stream: %d \n",
+                   transposeA ? "Yes" : "No", transposeB ? "Yes" : "No", sm_count, num_streams);
             printf("Tests: Dgemm:%s Zgemm:%s GemmEx(I8):%s LtMatmul(I8):%s Verbose:%s\n",
                    run_flags[0]?"Y":"N", run_flags[1]?"Y":"N", run_flags[2]?"Y":"N", run_flags[3]?"Y":"N", verbose ? "Y":"N");
             printf("---------------------------------------------------------------------\n");
@@ -440,12 +440,20 @@ int main(int argc, char *argv[]) {
         sm_count_to_use = total_sm_count; // Default to all SMs
     }
 
+    if (num_streams <= 0) {
+        if (rank == 0) { // Print warning only once if user specified invalid count
+             printf("Warning: Requested Stream count (%d) is invalid. Using default: 1.\n",
+                    num_streams);
+        }
+        num_streams = 1; // Default to all SMs
+    }
+
     // --- Run Selected Tests & Reduce ---
     // Pass deviceId and sm_count to runGemmTest
     if (run_flags[static_cast<int>(GemmOpIndex::DGEMM)]) {
         int idx = static_cast<int>(GemmOpIndex::DGEMM);
         auto result = runGemmTest<GemmOpIndex::DGEMM, double, double, double, double>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count); // Pass args
+                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -455,7 +463,7 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::ZGEMM)]) {
         int idx = static_cast<int>(GemmOpIndex::ZGEMM);
         auto result = runGemmTest<GemmOpIndex::ZGEMM, cuDoubleComplex, cuDoubleComplex, cuDoubleComplex, cuDoubleComplex>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count); // Pass args
+                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -465,7 +473,7 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::GEMM_EX_INT8)]) {
         int idx = static_cast<int>(GemmOpIndex::GEMM_EX_INT8);
         auto result = runGemmTest<GemmOpIndex::GEMM_EX_INT8, int8_t, int8_t, int32_t, int32_t>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count); // Pass args
+                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -475,7 +483,7 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::LT_MATMUL_INT8)]) {
         int idx = static_cast<int>(GemmOpIndex::LT_MATMUL_INT8);
         auto result = runGemmTest<GemmOpIndex::LT_MATMUL_INT8, int8_t, int8_t, int32_t, int32_t>
-                     (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count); // Pass args
+                     (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         bool skipped = (fabs(my_times_ms[idx]) < std::numeric_limits<float>::epsilon() && fabs(my_tops[idx]) < std::numeric_limits<double>::epsilon());
         if (verbose && !skipped) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
