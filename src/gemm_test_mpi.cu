@@ -115,8 +115,23 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
                                      const char* opName,
                                      int rank, int deviceId,
                                      int requested_sm_count,
-                                     int num_streams)
+                                     int num_streams,
+                                     int size_threshold,
+                                     int batch_count)
 {
+    // Determine if we should run in batched mode
+    bool run_batched = false;
+    // Only GEMM_EX_INT8 and LT_MATMUL_INT8 support batching via threshold in this code
+    if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8 || OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+        if (size_threshold > 0 && m < size_threshold && n < size_threshold && k < size_threshold) {
+            run_batched = true;
+        } else {
+            batch_count = 1; // Force batch_count to 1 if not running batched
+        }
+    } else {
+         batch_count = 1; // Force batch_count to 1 for non-INT8 types (DGEMM/ZGEMM)
+    }
+
     // --- Rest of the setup (LDA, LDB, LDC, LtMatmul constraints check) ---
     int lda = transposeA ? k : m;
     int ldb = transposeB ? n : k;
@@ -127,7 +142,7 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         }
     }
 
-    // --- Handle Creation (No change here) ---
+    // --- Handle Creation ---
     cublasHandle_t handle = nullptr;
     cublasLtHandle_t ltHandle = nullptr;
     if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
@@ -144,9 +159,12 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
 
     // --- Memory Allocation (MODIFIED) ---
     // Use streams[0] for async memory operations for simplicity
-    size_t sizeA = static_cast<size_t>(lda) * (transposeA ? m : k) * sizeof(TypeA);
-    size_t sizeB = static_cast<size_t>(ldb) * (transposeB ? k : n) * sizeof(TypeB);
-    size_t sizeC = static_cast<size_t>(ldc) * n * sizeof(TypeC);
+    size_t elementsA = static_cast<size_t>(lda) * (transposeA ? m : k);
+    size_t elementsB = static_cast<size_t>(ldb) * (transposeB ? k : n);
+    size_t elementsC = static_cast<size_t>(ldc) * n;
+    size_t sizeA = elementsA * sizeof(TypeA) * batch_count;
+    size_t sizeB = elementsB * sizeof(TypeB) * batch_count;
+    size_t sizeC = elementsC * sizeof(TypeC) * batch_count;
     TypeA *d_A = nullptr; TypeB *d_B = nullptr; TypeC *d_C = nullptr;
     TypeA *h_A = nullptr; TypeB *h_B = nullptr;
     bool alloc_success = true;
@@ -200,9 +218,20 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     else if constexpr (std::is_same_v<TypeCompute, float>) { alpha_compute = 1.0f; beta_compute = 0.0f; }
     else { static_assert(sizeof(TypeCompute) == 0, "Unsupported TypeCompute"); }
     cudaEvent_t start, stop; CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
+     
+    // --- LtMatmul Descriptors ---
     cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
     cublasLtMatmulDesc_t matmulDesc = nullptr;
     void *workspace = nullptr; size_t workspaceSize = 0;
+
+    // Calculate strides (used by both LtMatmul batched and GemmStridedBatchedEx)
+    // Ensure type is long long int for cublasGemmStridedBatchedEx
+    long long int strideA = 0, strideB = 0, strideC = 0;
+    if (run_batched) {
+        strideA = static_cast<long long int>(elementsA); 
+        strideB = static_cast<long long int>(elementsB);
+        strideC = static_cast<long long int>(elementsC);
+    }
 
     int returnedResults = 0;
     cublasLtMatmulHeuristicResult_t heuristicResult = {};
@@ -213,20 +242,30 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CudaDataType<TypeA>::value, lda, transposeA ? m : k, lda));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CudaDataType<TypeB>::value, ldb, transposeB ? k : n, ldb));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CudaDataType<TypeC>::value, m, n, ldc));
+        // Set batching attributes if running batched
+        if (run_batched) {
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideA, sizeof(strideA)));
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Bdesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Bdesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB)));
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Cdesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+             CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(Cdesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC)));
+        }
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, computeType, scaleType));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
         // Use streams[0] for workspace allocation
-        workspaceSize = 1024 * 1024 * 4; CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, streams[0]));
+        workspaceSize = 1024 * 1024 * 4; 
+        CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, streams[0]));
 
-        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&matmulPreference));
-        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(matmulPreference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
-        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, matmulDesc, Adesc, Bdesc, Cdesc, Cdesc, matmulPreference, 1, &heuristicResult, &returnedResults));
+        // CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&matmulPreference));
+        // CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(matmulPreference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+        // CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, matmulDesc, Adesc, Bdesc, Cdesc, Cdesc, matmulPreference, 1, &heuristicResult, &returnedResults));
         //cublasLtMatmulTile_t tileId = CUBLASLT_MATMUL_TILE_128x128;
         //cublasLtMatmulStages_t stageId = CUBLASLT_MATMUL_STAGES_UNDEFINED;
         //CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tileId, sizeof(tileId)));
-	//size_t size_written;
-	//CUBLAS_CHECK(cublasLtMatmulAlgoCapGetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CAP_STAGES_IDS, (void*)&stageId, sizeof(stageId), &size_written));
+        //size_t size_written;
+        //CUBLAS_CHECK(cublasLtMatmulAlgoCapGetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CAP_STAGES_IDS, (void*)&stageId, sizeof(stageId), &size_written));
         //CUBLAS_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&heuristicResult.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stageId, sizeof(stageId)));
     }
     // Use streams[0] to sync memory operations before warm-up
@@ -241,18 +280,42 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
 
     // --- Warm-up ---
     // Perform warm-up on streams[0]
-    if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
-        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
-        CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc));
-    } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
-        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
-        CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc));
-    } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
-        CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
-        CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
-    } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
-        // Pass streams[0] as argument for Lt API
-        CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, streams[0]));
+    if (run_batched) {
+        // Batched path: Choose between LtMatmul and GemmStridedBatchedEx
+        if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+            if (ltHandle && matmulDesc) { // Check Lt handles
+                CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, nullptr, workspace, workspaceSize, streams[0]));
+            }
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+            if (handle) { // Check v2 handle
+                CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, opA, opB, m, n, k,
+                                                     &alpha_compute,
+                                                     d_A, CudaDataType<TypeA>::value, lda, strideA,
+                                                     d_B, CudaDataType<TypeB>::value, ldb, strideB,
+                                                     &beta_compute,
+                                                     d_C, CudaDataType<TypeC>::value, ldc, strideC,
+                                                     batch_count,
+                                                     CUBLAS_COMPUTE_32I, // Compute type
+                                                     CUBLAS_GEMM_DEFAULT)); // Algo
+            }
+        }
+        // NOTE: Batched DGEMM/ZGEMM not implemented here, would use cublasDgemmStridedBatched etc.
+    } else {
+        if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
+            CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+            CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double*)&alpha_compute, d_A, lda, d_B, ldb, (const double*)&beta_compute, d_C, ldc));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
+            CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+            CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex*)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex*)&beta_compute, d_C, ldc));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+            CUBLAS_CHECK(cublasSetStream(handle, streams[0])); // Set stream for v2 API
+            CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+        } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+            // Pass streams[0] as argument for Lt API
+            //CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, streams[0]));
+            CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, nullptr, workspace, workspaceSize, streams[0]));
+        }
     }
     // Sync warm-up on streams[0]
     CUDA_CHECK(cudaStreamSynchronize(streams[0]));
@@ -263,23 +326,42 @@ std::pair<float, double> runGemmTest(int m, int n, int k, bool transposeA, bool 
     // Record start event on streams[0] *before* launching any timed work
     CUDA_CHECK(cudaEventRecord(start, streams[0]));
 
-    for (int i = 0; i < iterations; i++) {
+    for (int i = 0; i < iterations/batch_count; i++) {
         // Select stream for this iteration
         cudaStream_t current_stream = streams[i % num_streams];
-
-        // (Conditional GEMM calls remain the same)
-        if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
-            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
-            CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double *)&alpha_compute, d_A, lda, d_B, ldb, (const double *)&beta_compute, d_C, ldc));
-        } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
-            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
-            CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex *)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex *)&beta_compute, d_C, ldc));
-        } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
-            CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
-            CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
-        } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
-            // Pass current stream as argument for Lt API
-            CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, current_stream));
+        if (run_batched) {
+            // Batched path: Choose between LtMatmul and GemmStridedBatchedEx
+            if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+                CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, nullptr, workspace, workspaceSize, current_stream));
+            } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+                CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for v2 API
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, opA, opB, m, n, k,
+                                                        &alpha_compute,
+                                                        d_A, CudaDataType<TypeA>::value, lda, strideA,
+                                                        d_B, CudaDataType<TypeB>::value, ldb, strideB,
+                                                        &beta_compute,
+                                                        d_C, CudaDataType<TypeC>::value, ldc, strideC,
+                                                        batch_count,
+                                                        CUBLAS_COMPUTE_32I, // Compute type
+                                                        CUBLAS_GEMM_DEFAULT)); // Algo
+            }
+             // NOTE: Batched DGEMM/ZGEMM not implemented here
+        } else {
+            // single GEMM logic
+            if constexpr (OperationTypeIndex == GemmOpIndex::DGEMM) {
+                CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+                CUBLAS_CHECK(cublasDgemm(handle, opA, opB, m, n, k, (const double *)&alpha_compute, d_A, lda, d_B, ldb, (const double *)&beta_compute, d_C, ldc));
+            } else if constexpr (OperationTypeIndex == GemmOpIndex::ZGEMM) {
+                CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+                CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, (const cuDoubleComplex *)&alpha_compute, d_A, lda, d_B, ldb, (const cuDoubleComplex *)&beta_compute, d_C, ldc));
+            } else if constexpr (OperationTypeIndex == GemmOpIndex::GEMM_EX_INT8) {
+                CUBLAS_CHECK(cublasSetStream(handle, current_stream)); // Set stream for this call
+                CUBLAS_CHECK(cublasGemmEx(handle, opA, opB, m, n, k, &alpha_compute, d_A, CudaDataType<TypeA>::value, lda, d_B, CudaDataType<TypeB>::value, ldb, &beta_compute, d_C, CudaDataType<TypeC>::value, ldc, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+            } else if constexpr (OperationTypeIndex == GemmOpIndex::LT_MATMUL_INT8) {
+                // Pass current stream as argument for Lt API
+                //CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, &heuristicResult.algo, workspace, workspaceSize, current_stream));
+                CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha_compute, d_A, Adesc, d_B, Bdesc, &beta_compute, d_C, Cdesc, d_C, Cdesc, nullptr, workspace, workspaceSize, current_stream));
+            }
         }
     }
 
@@ -350,6 +432,8 @@ int main(int argc, char *argv[]) {
     int num_streams = 1;
     bool transposeA = true, transposeB = false, verbose = false;
     std::array<bool, NUM_TEST_TYPES> run_flags = {true, false, true, true}; // D, Z, Ex, Lt
+    int size_threshold = 0; 
+    int batch_count = 1;
 
     // Option parsing
     static struct option long_options[] = {
@@ -370,10 +454,12 @@ int main(int argc, char *argv[]) {
 	    {"ltmatmul", required_argument, 0, 'l'},
         {"sm-count", required_argument, 0, 's'},
         {"stream-count", required_argument, 0, 't'},
+        {"threshold", required_argument, 0, 'H'}, 
+        {"batch-count", required_argument, 0, 'B'}, 
         {0, 0, 0, 0}
     };
     int opt; int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:s:t:v1:2:3:4:d:z:g:l:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:s:t:v1:2:3:4:d:z:g:l:H:B:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'm': m = atoi(optarg); break; 
             case 'n': n = atoi(optarg); break;
@@ -392,7 +478,10 @@ int main(int argc, char *argv[]) {
             case 'z': run_flags[static_cast<int>(GemmOpIndex::ZGEMM)] = (atoi(optarg) != 0); break;
             case 'g': run_flags[static_cast<int>(GemmOpIndex::GEMM_EX_INT8)] = (atoi(optarg) != 0); break;
             case 'l': run_flags[static_cast<int>(GemmOpIndex::LT_MATMUL_INT8)] = (atoi(optarg) != 0); break;
-            case '?': if (rank == 0) { fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--sm-count|-s] <sm_count> [--stream-count|-t] <stream_count>\n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
+            case 'H': size_threshold = atoi(optarg); break; 
+            case 'B': batch_count = atoi(optarg); break; 
+            case '?': if (rank == 0) {
+                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--sm-count|-s] <sm_count> [--stream-count|-t] <stream_count> [--threshold|-H] <size> [--batch-count|-B] <count> \n", argv[0]); } MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); break;
             default: if (rank == 0) fprintf(stderr, "Unexpected option parsing error.\n"); MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
     }
@@ -416,6 +505,19 @@ int main(int argc, char *argv[]) {
         if (rank == 0) fprintf(stderr, "Error: m, n, k, iterations must be positive\n");
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
+    // Validation for threshold and batch count
+    if (size_threshold < 0) {
+        if (rank == 0) fprintf(stderr, "Error: Threshold must be non-negative.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    if (size_threshold > 0 && batch_count <= 0) {
+        if (rank == 0) fprintf(stderr, "Error: Batch count must be positive when threshold is > 0.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    // Ensure batch_count is 1 if thresholding is off
+    if (size_threshold == 0) {
+        batch_count = 1;
+    }
 
     // Print header (Rank 0)
     if (rank == 0) {
@@ -424,6 +526,7 @@ int main(int argc, char *argv[]) {
             printf("MPI GEMM Test: m=%d, n=%d, k=%d, iterations=%d, ranks=%d\n", m, n, k, iterations, size);
             printf("Transpose A: %s, Transpose B: %s, SM Count: %d, Stream: %d \n",
                    transposeA ? "Yes" : "No", transposeB ? "Yes" : "No", sm_count, num_streams);
+            printf("Batch Threshold: %d, Batch Count: %d\n", size_threshold, batch_count);
             printf("Tests: Dgemm:%s Zgemm:%s GemmEx(I8):%s LtMatmul(I8):%s Verbose:%s\n",
                    run_flags[0]?"Y":"N", run_flags[1]?"Y":"N", run_flags[2]?"Y":"N", run_flags[3]?"Y":"N", verbose ? "Y":"N");
             printf("---------------------------------------------------------------------\n");
@@ -474,7 +577,8 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::DGEMM)]) {
         int idx = static_cast<int>(GemmOpIndex::DGEMM);
         auto result = runGemmTest<GemmOpIndex::DGEMM, double, double, double, double>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
+                   (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams,
+                    0, 1); 
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -484,7 +588,8 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::ZGEMM)]) {
         int idx = static_cast<int>(GemmOpIndex::ZGEMM);
         auto result = runGemmTest<GemmOpIndex::ZGEMM, cuDoubleComplex, cuDoubleComplex, cuDoubleComplex, cuDoubleComplex>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
+                   (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams,
+                    0, 1); 
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -494,7 +599,8 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::GEMM_EX_INT8)]) {
         int idx = static_cast<int>(GemmOpIndex::GEMM_EX_INT8);
         auto result = runGemmTest<GemmOpIndex::GEMM_EX_INT8, int8_t, int8_t, int32_t, int32_t>
-                      (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
+                   (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams,
+                    size_threshold, batch_count); 
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         if (verbose) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
         if (rank == 0) { reduced_times_sum[idx] = my_times_ms[idx]; reduced_tops_sum[idx] = my_tops[idx]; } // Init rank 0 data for IN_PLACE
@@ -504,7 +610,8 @@ int main(int argc, char *argv[]) {
     if (run_flags[static_cast<int>(GemmOpIndex::LT_MATMUL_INT8)]) {
         int idx = static_cast<int>(GemmOpIndex::LT_MATMUL_INT8);
         auto result = runGemmTest<GemmOpIndex::LT_MATMUL_INT8, int8_t, int8_t, int32_t, int32_t>
-                     (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams); // Pass args
+                   (m, n, k, transposeA, transposeB, iterations, opFlops[idx], opNames[idx], rank, deviceId, sm_count, num_streams,
+                    size_threshold, batch_count); 
         my_times_ms[idx] = result.first; my_tops[idx] = result.second;
         bool skipped = (fabs(my_times_ms[idx]) < std::numeric_limits<float>::epsilon() && fabs(my_tops[idx]) < std::numeric_limits<double>::epsilon());
         if (verbose && !skipped) printf("| %4d | %-18s | %14.3f | %8.3f |\n", rank, opNames[idx], (iterations > 0 ? my_times_ms[idx]/iterations : 0.0), my_tops[idx]);
@@ -526,6 +633,11 @@ int main(int argc, char *argv[]) {
 
         for (int i = 0; i < NUM_TEST_TYPES; ++i) {
             if (run_flags[i]) {
+                bool is_int8_batched = false;
+                if ((static_cast<GemmOpIndex>(i) == GemmOpIndex::GEMM_EX_INT8 || static_cast<GemmOpIndex>(i) == GemmOpIndex::LT_MATMUL_INT8)
+                     && size_threshold > 0 && m < size_threshold && n < size_threshold && k < size_threshold) {
+                      is_int8_batched = true;
+                }  
                 bool skipped_agg = (fabs(reduced_times_sum[i]) < std::numeric_limits<float>::epsilon() * size &&
                                     fabs(reduced_tops_sum[i]) < std::numeric_limits<double>::epsilon() * size);
 
@@ -533,7 +645,9 @@ int main(int argc, char *argv[]) {
                     printf("| %-18s | %18s | %11s |\n", opNames[i], "Skipped", "N/A");
                 } else {
                     double avg_time_all_ranks = (size > 0 && iterations > 0) ? reduced_times_sum[i] / size / iterations : 0.0;
-                    printf("| %-18s | %18.3f | %11.3f |\n", opNames[i], avg_time_all_ranks, reduced_tops_sum[i]);
+                    char name_buffer[40];
+                   snprintf(name_buffer, sizeof(name_buffer), "%s%s", opNames[i], is_int8_batched ? " (B)" : "");
+                   printf("| %-18s | %18.3f | %11.3f |\n", name_buffer, avg_time_all_ranks, reduced_tops_sum[i]);
                 }
             }
         }
